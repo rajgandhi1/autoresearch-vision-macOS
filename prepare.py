@@ -1,388 +1,235 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+One-time data preparation for vision-language autoresearch experiments.
+Downloads a subset of WikiArt from HuggingFace and caches images + metadata.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    uv run prepare.py                          # default (3500 train + 500 val)
+    uv run prepare.py --num-train 500          # smaller subset for testing
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Data cached at ~/.cache/autoresearch/wikiart/.
 """
 
 import os
 import sys
 import time
 import math
+import json
+import random
 import argparse
-import pickle
-from multiprocessing import Pool
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
 import torch
+import tiktoken
+from PIL import Image
+import torchvision.transforms as T
+
+
+def verify_macos_env():
+    if sys.platform != "darwin":
+        raise RuntimeError(f"This script requires macOS with Metal. Detected platform: {sys.platform}")
+    if not torch.backends.mps.is_available():
+        raise RuntimeError("MPS (Metal Performance Shaders) is not available. Ensure you are running on Apple Silicon.")
+    print("Environment verified: macOS detected with Metal (MPS) hardware acceleration available.")
+    print()
+
+
+verify_macos_env()
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+IMAGE_SIZE   = 128    # input image resolution (H × W)
+PATCH_SIZE   = 16     # ViT patch size → (IMAGE_SIZE / PATCH_SIZE)² patches per image
+MAX_TEXT_LEN = 32     # max tokens per text description (including CLS token)
+TIME_BUDGET  = 300    # training time budget in seconds (5 minutes)
+EVAL_IMAGES  = 256    # validation images used for recall@1 evaluation
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Paths
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+CACHE_DIR     = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
+DATA_DIR      = os.path.join(CACHE_DIR, "wikiart")
+METADATA_FILE = os.path.join(DATA_DIR, "metadata.json")
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+NUM_TRAIN = 3500
+NUM_VAL   = 500
 
 # ---------------------------------------------------------------------------
-# Data download
+# Tokenizer
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
+class Tokenizer:
+    """
+    GPT-2 tokenizer via tiktoken. No training required.
+    The EOT token (50256) is prepended as a CLS token at position 0.
+    TextTransformer reads position 0 as the text representation.
+    """
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+    def __init__(self):
+        self.enc = tiktoken.get_encoding("gpt2")
+        self.cls_token = self.enc.eot_token  # 50256
+
+    @classmethod
+    def from_directory(cls):
+        return cls()
+
+    def get_vocab_size(self):
+        return self.enc.n_vocab
+
+    def encode(self, text):
+        """Return a fixed-length list of MAX_TEXT_LEN token ids. CLS at position 0."""
+        tokens = [self.cls_token]
+        tokens += self.enc.encode_ordinary(text)[: MAX_TEXT_LEN - 1]
+        tokens = tokens[:MAX_TEXT_LEN]
+        tokens += [0] * (MAX_TEXT_LEN - len(tokens))  # zero-pad
+        return tokens
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+# ---------------------------------------------------------------------------
+# Data preparation
+# ---------------------------------------------------------------------------
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+def make_text(sample):
+    """Construct text description from WikiArt metadata fields."""
+    artist = str(sample.get("artist") or "Unknown")
+    style  = str(sample.get("style")  or "Unknown")
+    return f"A {style} painting by {artist}"
+
+
+def prepare_data(num_train=NUM_TRAIN, num_val=NUM_VAL):
+    """Stream WikiArt from HuggingFace and cache images + metadata to disk."""
+    if os.path.exists(METADATA_FILE):
+        print(f"Data: already prepared at {DATA_DIR}")
         return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    print("Data: downloading WikiArt subset from HuggingFace (streaming)...")
+    from datasets import load_dataset
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
+    os.makedirs(os.path.join(DATA_DIR, "train"), exist_ok=True)
+    os.makedirs(os.path.join(DATA_DIR, "val"),   exist_ok=True)
 
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+    dataset = load_dataset("huggan/wikiart", split="train", streaming=True, trust_remote_code=True)
 
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
+    metadata = {"train": [], "val": []}
+    total = num_train + num_val
     t0 = time.time()
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    for i, sample in enumerate(dataset):
+        if i >= total:
+            break
+        split    = "train" if i < num_train else "val"
+        img_path = os.path.join(DATA_DIR, split, f"{i:06d}.jpg")
+        try:
+            img  = sample["image"].convert("RGB")
+            img.save(img_path, quality=85)
+            text = make_text(sample)
+            metadata[split].append({"path": img_path, "text": text})
+        except Exception as e:
+            print(f"  Skipping sample {i}: {e}")
+            continue
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
+        if (i + 1) % 500 == 0:
+            print(f"  {i + 1}/{total} images cached ({time.time() - t0:.0f}s elapsed)")
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+    with open(METADATA_FILE, "w") as f:
+        json.dump(metadata, f)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+    print(f"Data: {len(metadata['train'])} train + {len(metadata['val'])} val images saved to {DATA_DIR}")
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
 
 # ---------------------------------------------------------------------------
 # Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
+_MEAN = [0.485, 0.456, 0.406]
+_STD  = [0.229, 0.224, 0.225]
 
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+_TRAIN_TRANSFORM = T.Compose([
+    T.RandomResizedCrop(IMAGE_SIZE, scale=(0.7, 1.0)),
+    T.RandomHorizontalFlip(),
+    T.ToTensor(),
+    T.Normalize(_MEAN, _STD),
+])
 
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
+_VAL_TRANSFORM = T.Compose([
+    T.Resize(IMAGE_SIZE),
+    T.CenterCrop(IMAGE_SIZE),
+    T.ToTensor(),
+    T.Normalize(_MEAN, _STD),
+])
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def make_dataloader(batch_size, split):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    Infinite dataloader for image-text pairs.
+    Yields (images [B, 3, H, W], text_tokens [B, T]) on device.
+    Shuffles the dataset each epoch.
     """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    assert split in ("train", "val")
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
+    with open(METADATA_FILE) as f:
+        metadata = json.load(f)[split]
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    tokenizer = Tokenizer()
+    device    = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    transform = _TRAIN_TRANSFORM if split == "train" else _VAL_TRANSFORM
+
+    indices = list(range(len(metadata)))
 
     while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+        random.shuffle(indices)
+        for i in range(0, len(indices) - batch_size + 1, batch_size):
+            batch  = [metadata[j] for j in indices[i : i + batch_size]]
+            images, texts = [], []
+            for item in batch:
+                img = Image.open(item["path"]).convert("RGB")
+                images.append(transform(img))
+                texts.append(torch.tensor(tokenizer.encode(item["text"]), dtype=torch.long))
+            yield torch.stack(images).to(device), torch.stack(texts).to(device)
 
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_recall(model, batch_size):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    Image-to-text recall@1 on EVAL_IMAGES validation samples.
+    For each image embedding, checks whether its closest text embedding
+    is the correct paired text. Higher is better (range: 0.0 to 1.0).
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
+    val_loader = make_dataloader(batch_size, "val")
+    steps = EVAL_IMAGES // batch_size
+
+    all_img, all_txt = [], []
     for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+        images, texts = next(val_loader)
+        img_feat, txt_feat = model.encode(images, texts)
+        all_img.append(img_feat.cpu().float())
+        all_txt.append(txt_feat.cpu().float())
+
+    img_feats = torch.cat(all_img)   # [N, embed_dim]
+    txt_feats = torch.cat(all_txt)   # [N, embed_dim]
+    sim = img_feats @ txt_feats.T    # [N, N] cosine similarity (features already normalized)
+    n   = img_feats.shape[0]
+    recall_1 = (sim.argmax(dim=1) == torch.arange(n)).float().mean().item()
+    return recall_1
+
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="Prepare WikiArt data for vision-language autoresearch")
+    parser.add_argument("--num-train", type=int, default=NUM_TRAIN, help="Training images to cache")
+    parser.add_argument("--num-val",   type=int, default=NUM_VAL,   help="Validation images to cache")
     args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
     print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
+    prepare_data(args.num_train, args.num_val)
     print()
     print("Done! Ready to train.")
