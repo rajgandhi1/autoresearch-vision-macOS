@@ -190,15 +190,17 @@ def make_dataloader(batch_size, split):
 
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# Evaluation (DO NOT CHANGE — these are the fixed metrics)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def evaluate_recall(model, batch_size):
     """
-    Image-to-text recall@1 on EVAL_IMAGES validation samples.
-    For each image embedding, checks whether its closest text embedding
-    is the correct paired text. Higher is better (range: 0.0 to 1.0).
+    Image-to-text retrieval metrics on EVAL_IMAGES validation samples.
+    Returns recall@1, recall@5, recall@10, and mAP.
+    - recall@k: fraction of image queries whose correct text is in the top-k results.
+    - mAP: mean reciprocal rank (= mAP when each query has one relevant item).
+    All metrics range 0.0 to 1.0; higher is better.
     """
     val_loader = make_dataloader(batch_size, "val")
     steps = EVAL_IMAGES // batch_size
@@ -214,8 +216,17 @@ def evaluate_recall(model, batch_size):
     txt_feats = torch.cat(all_txt)   # [N, embed_dim]
     sim = img_feats @ txt_feats.T    # [N, N] cosine similarity (features already normalized)
     n   = img_feats.shape[0]
-    recall_1 = (sim.argmax(dim=1) == torch.arange(n)).float().mean().item()
-    return recall_1
+
+    # 0-indexed rank of the correct text for each image query
+    sorted_idx    = sim.argsort(dim=1, descending=True)                          # [N, N]
+    correct_ranks = (sorted_idx == torch.arange(n).unsqueeze(1)).nonzero()[:, 1] # [N]
+
+    return {
+        "recall@1":  (correct_ranks < 1).float().mean().item(),
+        "recall@5":  (correct_ranks < 5).float().mean().item(),
+        "recall@10": (correct_ranks < 10).float().mean().item(),
+        "mAP":       (1.0 / (correct_ranks.float() + 1)).mean().item(),
+    }
 
 
 # ---------------------------------------------------------------------------

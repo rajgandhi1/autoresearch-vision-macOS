@@ -30,9 +30,9 @@ Each experiment runs on a single GPU/MPS device. The training script runs for a 
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 - Modify the evaluation harness. The `evaluate_recall` function in `prepare.py` is the ground truth metric.
 
-**The goal is simple: get the highest val_recall@1.** This is image-to-text recall at rank 1 — for each validation image embedding, it checks if the closest text embedding in the batch is the correct paired text. Range is 0.0 (random chance at 1/256) to 1.0 (perfect). Since the time budget is fixed, you don't need to worry about training time. Everything is fair game: architecture, optimizer, hyperparameters, batch size, model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The goal is simple: get the highest val_recall@1 and val_mAP.** This is image-to-text retrieval — for each validation image embedding, it checks if the closest text embedding is the correct paired text. val_recall@1 range is 0.0 (random chance at 1/256) to 1.0 (perfect); val_mAP (mean reciprocal rank) rewards getting the correct match higher in the ranking. Since the time budget is fixed, you don't need to worry about training time. Everything is fair game: architecture, optimizer, hyperparameters, batch size, model size. The only constraint is that the code runs without crashing and finishes within the time budget.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_recall@1 gains, but it should not blow up dramatically.
+**VRAM** is a soft constraint. Some increase is acceptable for meaningful metric gains, but it should not blow up dramatically.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_recall@1 improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
@@ -45,6 +45,9 @@ Once the script finishes it prints a summary like this:
 ```
 ---
 val_recall@1:     0.093750
+val_recall@5:     0.250000
+val_recall@10:    0.390625
+val_mAP:          0.156250
 training_seconds: 300.1
 total_seconds:    325.9
 peak_vram_mb:     0.0
@@ -55,36 +58,37 @@ vit_depth:        4
 text_depth:       4
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform the numbers will look different. Extract the key metric from the log:
+Note that the script is configured to always stop after 5 minutes, so depending on the computing platform the numbers will look different. Extract the key metrics from the log:
 
 ```
-grep "^val_recall@1:" run.log
+grep "^val_recall@1:\|^val_mAP:\|^peak_vram_mb:" run.log
 ```
 
 ## Logging results
 
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
-The TSV has a header row and 5 columns:
+The TSV has a header row and 6 columns:
 
 ```
-commit	val_recall@1	memory_gb	status	description
+commit	val_recall@1	val_mAP	memory_gb	status	description
 ```
 
 1. git commit hash (short, 7 chars)
 2. val_recall@1 achieved (e.g. 0.093750) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 1.2 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+3. val_mAP achieved (e.g. 0.156250) — use 0.000000 for crashes
+4. peak memory in GB, round to .1f (e.g. 1.2 — divide peak_vram_mb by 1024) — use 0.0 for crashes
+5. status: `keep`, `discard`, or `crash`
+6. short text description of what this experiment tried
 
 Example:
 
 ```
-commit	val_recall@1	memory_gb	status	description
-a1b2c3d	0.093750	0.0	keep	baseline
-b2c3d4e	0.109375	0.0	keep	increase MATRIX_LR to 0.02
-c3d4e5f	0.078125	0.0	discard	switch to deeper text encoder (TEXT_DEPTH=8)
-d4e5f6g	0.000000	0.0	crash	double VIT_DIM to 512 (OOM)
+commit	val_recall@1	val_mAP	memory_gb	status	description
+a1b2c3d	0.093750	0.156250	0.0	keep	baseline
+b2c3d4e	0.109375	0.178000	0.0	keep	increase MATRIX_LR to 0.02
+c3d4e5f	0.078125	0.134000	0.0	discard	switch to deeper text encoder (TEXT_DEPTH=8)
+d4e5f6g	0.000000	0.000000	0.0	crash	double VIT_DIM to 512 (OOM)
 ```
 
 ## The experiment loop
@@ -97,7 +101,7 @@ LOOP FOREVER:
 2. Tune `train.py` with an experimental idea by directly hacking the code.
 3. git commit
 4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_recall@1:\|^peak_vram_mb:" run.log`
+5. Read out the results: `grep "^val_recall@1:\|^val_mAP:\|^peak_vram_mb:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
 7. Record the results in the tsv
 8. If val_recall@1 **increased** (higher is better), you "advance" the branch, keeping the git commit
