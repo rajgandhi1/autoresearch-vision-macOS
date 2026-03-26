@@ -588,7 +588,7 @@ total_images = step * TOTAL_BATCH_SIZE
 # Final evaluation
 model.eval()
 with autocast_ctx:
-    val_recall = evaluate_recall(model, DEVICE_BATCH_SIZE)
+    metrics = evaluate_recall(model, DEVICE_BATCH_SIZE)
 
 t_end = time.time()
 if device_type == "cuda":
@@ -597,7 +597,10 @@ else:
     peak_vram_mb = 0.0
 
 print("---")
-print(f"val_recall@1:     {val_recall:.6f}")
+print(f"val_recall@1:     {metrics['recall@1']:.6f}")
+print(f"val_recall@5:     {metrics['recall@5']:.6f}")
+print(f"val_recall@10:    {metrics['recall@10']:.6f}")
+print(f"val_mAP:          {metrics['mAP']:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
