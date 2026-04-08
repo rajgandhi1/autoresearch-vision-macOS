@@ -170,6 +170,7 @@ class CLIP(nn.Module):
         self.vision      = VisionTransformer(vit_config)
         self.text        = TextTransformer(text_config)
         self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
+        self.logit_bias  = nn.Parameter(torch.zeros([]))
 
     @torch.no_grad()
     def init_weights(self):
@@ -198,13 +199,13 @@ class CLIP(nn.Module):
         return img_feat, txt_feat
 
     def forward(self, images, texts):
-        """Symmetric InfoNCE (CLIP) contrastive loss."""
+        """SigLIP contrastive loss: sigmoid binary cross-entropy per pair."""
         img_feat, txt_feat = self.encode(images, texts)
         logit_scale = self.logit_scale.exp().clamp(max=100)
-        logits = logit_scale * img_feat @ txt_feat.T        # [B, B]
-        B      = images.shape[0]
-        labels = torch.arange(B, device=images.device)
-        loss   = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+        logits = logit_scale * img_feat @ txt_feat.T  # [B, B]
+        B = images.shape[0]
+        labels = 2 * torch.eye(B, device=images.device) - 1  # +1 diagonal, -1 off-diagonal
+        loss = -F.logsigmoid(labels * (logits + self.logit_bias)).mean()
         return loss
 
     def num_params(self):
